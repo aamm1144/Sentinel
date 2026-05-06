@@ -21,11 +21,12 @@ public sealed class ProxySession : IProxySession
     private readonly TcpClient _client;
     private readonly TcpClient _server;
     private readonly IPacketLogger _packetLogger;
-    private readonly ILogger<ProxySession> _logger;
+    private readonly ILogger<ProxySession> _sessionLogger;
+    private readonly ILogger _logger; // General logger for MITM logic
     private readonly string _endpointName;
     private readonly bool _enableMitm;
     private readonly bool _enableGameplayDecrypt;
-    private readonly Func<bool, ICipher>? _handshakeCipherFactory;
+    private readonly Func<bool, string, ICipher>? _handshakeCipherFactory;
 
     // Read-only gameplay decryption state (null when not in this mode)
     private GameplaySessionState? _gameplayState;
@@ -37,10 +38,10 @@ public sealed class ProxySession : IProxySession
     private bool _isActive;
 
     // Post-handshake cipher instances (null = transparent mode)
-    private BlowfishCfb64Cipher? _clientDecrypt; // Decrypt data FROM client
-    private BlowfishCfb64Cipher? _clientEncrypt; // Encrypt data TO client
-    private BlowfishCfb64Cipher? _serverDecrypt; // Decrypt data FROM server
-    private BlowfishCfb64Cipher? _serverEncrypt; // Encrypt data TO server
+    private ICipher? _clientDecrypt; // Decrypt data FROM client
+    private ICipher? _clientEncrypt; // Encrypt data TO client
+    private ICipher? _serverDecrypt; // Decrypt data FROM server
+    private ICipher? _serverEncrypt; // Encrypt data TO server
 
     public Guid Id { get; } = Guid.NewGuid();
     public DateTimeOffset ConnectedAt { get; } = DateTimeOffset.UtcNow;
@@ -57,15 +58,17 @@ public sealed class ProxySession : IProxySession
         TcpClient client,
         TcpClient server,
         IPacketLogger packetLogger,
-        ILogger<ProxySession> logger,
+        ILogger<ProxySession> sessionLogger,
+        ILogger logger,
         string endpointName,
         bool enableMitm = false,
-        Func<bool, ICipher>? handshakeCipherFactory = null,
+        Func<bool, string, ICipher>? handshakeCipherFactory = null,
         bool enableGameplayDecrypt = false)
     {
         _client = client;
         _server = server;
         _packetLogger = packetLogger;
+        _sessionLogger = sessionLogger;
         _logger = logger;
         _endpointName = endpointName;
         _enableMitm = enableMitm;
@@ -147,11 +150,6 @@ public sealed class ProxySession : IProxySession
         }
     }
 
-    /// <summary>
-    /// Perform the CO 7xxx DH MITM handshake by delegating to <see cref="HandshakeMitm"/>.
-    /// The client sends the DH init first; the server replies.
-    /// On success, four BF-CFB64 session ciphers are assigned to the session fields.
-    /// </summary>
     private async Task PerformHandshakeAsync(
         NetworkStream clientStream,
         NetworkStream serverStream,
@@ -159,23 +157,18 @@ public sealed class ProxySession : IProxySession
     {
         if (_handshakeCipherFactory is null)
             throw new InvalidOperationException(
-                "MITM is enabled but no handshake cipher factory was provided. " +
-                "Ensure HandshakeChainTablePath is set and the chain table file exists.");
+                "MITM is enabled but no handshake cipher factory was provided.");
 
         var mitm = new HandshakeMitm(_handshakeCipherFactory, _logger);
         var result = await mitm.PerformAsync(clientStream, serverStream, ct);
 
-        // Transfer cipher ownership from HandshakeResult to the session fields.
+        // Transfer cipher ownership
         _clientDecrypt = result.ClientDecrypt;
         _clientEncrypt = result.ClientEncrypt;
         _serverDecrypt = result.ServerDecrypt;
         _serverEncrypt = result.ServerEncrypt;
     }
 
-    /// <summary>
-    /// Forward all data from source to destination, logging each chunk.
-    /// When MITM ciphers are active, decrypts for logging and re-encrypts for forwarding.
-    /// </summary>
     private async Task ForwardAsync(
         NetworkStream source,
         NetworkStream destination,
@@ -218,7 +211,6 @@ public sealed class ProxySession : IProxySession
 
                         if (decryptCipher is not null && encryptCipher is not null)
                         {
-                            // MITM mode: decrypt → log plaintext → re-encrypt → forward
                             var mutable = segment.ToArray();
                             decryptCipher.Decrypt(mutable);
 
@@ -228,9 +220,7 @@ public sealed class ProxySession : IProxySession
                             }
                             catch (Exception ex)
                             {
-                                _logger.LogWarning(ex,
-                                    "[{Endpoint}] {Dir} packet logging failed ({Bytes} bytes)",
-                                    _endpointName, dirLabel, segment.Length);
+                                _logger.LogWarning(ex, "[{Endpoint}] {Dir} packet logging failed", _endpointName, dirLabel);
                             }
 
                             encryptCipher.Encrypt(mutable);
@@ -238,37 +228,16 @@ public sealed class ProxySession : IProxySession
                         }
                         else if (_gameplayState is not null)
                         {
-                            // Read-only gameplay decrypt mode:
-                            // always forward the original encrypted bytes; log a decrypted copy.
                             if (_gameplayState.Phase == SessionPhase.Handshake)
                             {
                                 bool switched = _gameplayState.OnHandshakeMessage(direction, segment.Length);
-                                _logger.LogInformation(
-                                    "[{Endpoint}] Session {Id:N8} — Handshake msg: {Dir} {Size} bytes (C2S={C2S}, S2C={S2C})",
-                                    _endpointName, Id.ToString()[..8], dirLabel, segment.Length,
-                                    _gameplayState.ClientToServerCount, _gameplayState.ServerToClientCount);
                                 if (switched)
-                                    _logger.LogInformation(
-                                        "[{Endpoint}] Session {Id:N8} — Handshake complete, switching to gameplay decryption (total handshake: C2S={C2SBytes} bytes, S2C={S2CBytes} bytes)",
-                                        _endpointName, Id.ToString()[..8],
-                                        _gameplayState.TotalClientToServerBytes,
-                                        _gameplayState.TotalServerToClientBytes);
+                                    _logger.LogInformation("[{Endpoint}] Session {Id:N8} — Handshake complete, switching to gameplay decryption", _endpointName, Id.ToString()[..8]);
 
-                                // Handshake messages pass through as-is (log raw bytes)
-                                try
-                                {
-                                    await _packetLogger.LogPacketAsync(Id, direction, segment, timestamp);
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogWarning(ex,
-                                        "[{Endpoint}] {Dir} packet logging failed ({Bytes} bytes)",
-                                        _endpointName, dirLabel, segment.Length);
-                                }
+                                try { await _packetLogger.LogPacketAsync(Id, direction, segment, timestamp); } catch { }
                             }
                             else
                             {
-                                // Gameplay phase: decrypt a copy for the log, forward the original
                                 var copy = segment.ToArray();
                                 if (direction == PacketDirection.ServerToClient)
                                 {
@@ -284,79 +253,25 @@ public sealed class ProxySession : IProxySession
                                     ConquerCipher.Transform(copy, 0, copy.Length, ref cA, ref cB);
                                 }
 
-                                // DEBUG: show first 8 bytes of original vs decrypted
-                                if (copy.Length >= 8)
-                                {
-                                    _logger.LogDebug(
-                                        "[{Endpoint}] {Dir} DECRYPT CHECK — original: {Orig} → decrypted: {Dec}",
-                                        _endpointName, dirLabel,
-                                        BitConverter.ToString(segment.ToArray(), 0, Math.Min(8, segment.Length)),
-                                        BitConverter.ToString(copy, 0, Math.Min(8, copy.Length)));
-                                }
-
-                                try
-                                {
-                                    await _packetLogger.LogPacketAsync(Id, direction, copy, timestamp);
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogWarning(ex,
-                                        "[{Endpoint}] {Dir} packet logging failed ({Bytes} bytes)",
-                                        _endpointName, dirLabel, segment.Length);
-                                }
+                                try { await _packetLogger.LogPacketAsync(Id, direction, copy, timestamp); } catch { }
                             }
-
-                            // Always forward the original encrypted segment
                             await destination.WriteAsync(segment, ct);
                         }
                         else
                         {
-                            // Transparent mode: log raw → forward
-                            try
-                            {
-                                await _packetLogger.LogPacketAsync(Id, direction, segment, timestamp);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogWarning(ex,
-                                    "[{Endpoint}] {Dir} packet logging failed ({Bytes} bytes)",
-                                    _endpointName, dirLabel, segment.Length);
-                            }
-
+                            try { await _packetLogger.LogPacketAsync(Id, direction, segment, timestamp); } catch { }
                             await destination.WriteAsync(segment, ct);
                         }
                     }
                 }
 
                 reader.AdvanceTo(buffer.End);
-
-                if (result.IsCompleted)
-                {
-                    _logger.LogDebug("[{Endpoint}] {Dir} stream completed (remote closed)",
-                        _endpointName, dirLabel);
-                    break;
-                }
+                if (result.IsCompleted) break;
             }
         }
-        catch (OperationCanceledException)
-        {
-            _logger.LogDebug("[{Endpoint}] {Dir} relay cancelled", _endpointName, dirLabel);
-            throw;
-        }
-        catch (IOException ex)
-        {
-            _logger.LogDebug("[{Endpoint}] {Dir} relay ended — IOException: {Message}",
-                _endpointName, dirLabel, ex.Message);
-        }
-        catch (SocketException ex)
-        {
-            _logger.LogDebug("[{Endpoint}] {Dir} relay ended — SocketException: {Message}",
-                _endpointName, dirLabel, ex.Message);
-        }
-        finally
-        {
-            await reader.CompleteAsync();
-        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { _logger.LogDebug("[{Endpoint}] {Dir} relay ended: {Message}", _endpointName, dirLabel, ex.Message); }
+        finally { await reader.CompleteAsync(); }
     }
 
     private void DisposeCiphers()
@@ -374,13 +289,10 @@ public sealed class ProxySession : IProxySession
     public async ValueTask DisposeAsync()
     {
         _isActive = false;
-
         try { _client.Close(); } catch { }
         try { _server.Close(); } catch { }
-
         _client.Dispose();
         _server.Dispose();
-
         DisposeCiphers();
         await _packetLogger.FlushAsync();
     }
