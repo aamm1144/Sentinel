@@ -1,7 +1,24 @@
-on:
-  push:
-  workflow_dispatch:
-
+name: Build Sentinel
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.x
+      - name: Build C++ Hook
+        run: |
+          cd src/Sentinel.Hook
+          ./build.bat
+      - name: Build Sentinel CLI
+        run: dotnet publish src/Sentinel.CLI -c Release -r win-x64 --self-contained true -o ./publish/cli
+      - name: Build Sentinel Loader
+        run: dotnet publish src/Sentinel.Loader -c Release -r win-x86 --self-contained true -o ./publish/loader
+      - name: Collect DLLs
+        run: |
           if (Test-Path "src/Sentinel.Hook/build/SentinelHook.dll") {
             copy src/Sentinel.Hook/build/SentinelHook.dll publish/cli/
             copy src/Sentinel.Hook/build/SentinelHook.dll publish/loader/
@@ -10,3 +27,8 @@ on:
             copy src/Sentinel.Hook/build/Release/SentinelHook.dll publish/loader/
           }
         shell: pwsh
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sentinel-Build
+          path: ./publish/
