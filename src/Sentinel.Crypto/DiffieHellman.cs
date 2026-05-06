@@ -13,6 +13,14 @@ namespace Sentinel.Crypto;
 /// </summary>
 public sealed class DiffieHellman : IKeyExchange
 {
+    // Default P/G from Elitepvpers thread (used by many private servers)
+    private const string KnownP = 
+        "A320A85EDD79171C341459E94807D71D39BB3B3F" +
+        "3B5161CA84894F3AC3FC7FEC317A2DDEC83B66D3" +
+        "0C29261C6492643061AECFCF4A051816D7C359A6" +
+        "A7B7D8FB";
+    private const string KnownG = "05";
+
     private DHParameters? _parameters;
     private DHPrivateKeyParameters? _privateKey;
     private DHPublicKeyParameters? _publicKey;
@@ -22,8 +30,18 @@ public sealed class DiffieHellman : IKeyExchange
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        var p = new BigInteger(1, prime.ToArray());
-        var g = new BigInteger(1, generator.ToArray());
+        BigInteger p;
+        if (prime.Length > 0)
+            p = new BigInteger(1, prime.ToArray());
+        else
+            p = new BigInteger(KnownP, 16);
+
+        BigInteger g;
+        if (generator.Length > 0)
+            g = new BigInteger(1, generator.ToArray());
+        else
+            g = new BigInteger(KnownG, 16);
+
         _parameters = new DHParameters(p, g);
     }
 
