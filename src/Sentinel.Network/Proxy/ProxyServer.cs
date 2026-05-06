@@ -4,7 +4,6 @@ using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using Sentinel.Core.Interfaces;
 using Sentinel.Core.Models;
-using Sentinel.Crypto;
 using Sentinel.Crypto.Interfaces;
 
 namespace Sentinel.Network.Proxy;
@@ -19,7 +18,7 @@ public sealed class ProxyServer : IProxyServer
     private readonly IPacketLogger _packetLogger;
     private readonly ILogger<ProxySession> _sessionLogger;
     private readonly ILogger<ProxyServer> _logger;
-    private readonly Func<bool, ICipher>? _handshakeCipherFactory;
+    private readonly Func<bool, string, ICipher>? _handshakeCipherFactory;
 
     private readonly ConcurrentDictionary<Guid, IProxySession> _sessions = new();
     private TcpListener? _listener;
@@ -35,7 +34,7 @@ public sealed class ProxyServer : IProxyServer
         IPacketLogger packetLogger,
         ILogger<ProxySession> sessionLogger,
         ILogger<ProxyServer> logger,
-        Func<bool, ICipher>? handshakeCipherFactory = null)
+        Func<bool, string, ICipher>? handshakeCipherFactory = null)
     {
         _config = config;
         _packetLogger = packetLogger;
@@ -90,6 +89,7 @@ public sealed class ProxyServer : IProxyServer
 
             session = new ProxySession(
                 client, server, _packetLogger, _sessionLogger,
+                _logger, // using server logger as a general logger if needed
                 _config.Name, _config.EnableMitm, _handshakeCipherFactory,
                 _config.EnableGameplayDecrypt);
 
