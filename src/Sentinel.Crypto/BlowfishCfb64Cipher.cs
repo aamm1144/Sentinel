@@ -71,26 +71,28 @@ public sealed class BlowfishCfb64Cipher : ICipher
 
     /// <summary>
     /// Inject a pre-computed P-array AND S-boxes captured from the game's memory.
-    /// Enables full 14-round Blowfish with real S-boxes — required for correct
-    /// BF_encrypt output on any IV other than the one trivially solvable.
+    /// Enables full Blowfish with real S-boxes. 
+    /// 
+    /// If p.Length is 16, it uses 14-round mode (CO 7xxx modified).
+    /// If p.Length is 18, it uses standard 16-round mode.
     ///
     /// S-boxes may be any power-of-2 length; a bitmask is derived automatically.
     /// All four S-boxes must be the same length.
     /// </summary>
     public void SetRawState(
-        ReadOnlySpan<uint> p14,
+        ReadOnlySpan<uint> p,
         ReadOnlySpan<uint> s0, ReadOnlySpan<uint> s1,
         ReadOnlySpan<uint> s2, ReadOnlySpan<uint> s3)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (p14.Length != 16)
-            throw new ArgumentException("P-array must have exactly 16 entries.", nameof(p14));
+        if (p.Length != 16 && p.Length != 18)
+            throw new ArgumentException("P-array must have exactly 16 (14-round) or 18 (16-round) entries.", nameof(p));
         if (s0.Length == 0 || (s0.Length & (s0.Length - 1)) != 0)
             throw new ArgumentException("S-box length must be a non-zero power of 2.", nameof(s0));
         if (s1.Length != s0.Length || s2.Length != s0.Length || s3.Length != s0.Length)
             throw new ArgumentException("All four S-boxes must be the same length.", nameof(s1));
 
-        _rawP  = p14.ToArray();
+        _rawP  = p.ToArray();
         _rawS0 = s0.ToArray();
         _rawS1 = s1.ToArray();
         _rawS2 = s2.ToArray();
@@ -176,13 +178,14 @@ public sealed class BlowfishCfb64Cipher : ICipher
 
             xl ^= _rawP[0];
 
+            var numRounds = _rawP.Length - 2;
+
             if (_rawS0 is not null)
             {
-                // Full 14-round BF with real S-boxes.  S-box length is a power of 2,
-                // so mask = length-1 handles any size (256 for standard, 32, 64, 128 …).
+                // Full rounds with real S-boxes.
                 var s0 = _rawS0; var s1 = _rawS1!; var s2 = _rawS2!; var s3 = _rawS3!;
                 var mask = (uint)(s0.Length - 1);
-                for (var i = 1; i <= 13; i += 2)
+                for (var i = 1; i <= numRounds - 1; i += 2)
                 {
                     xr ^= BfF(xl, s0, s1, s2, s3, mask) ^ _rawP[i];
                     xl ^= BfF(xr, s0, s1, s2, s3, mask) ^ _rawP[i + 1];
@@ -191,14 +194,14 @@ public sealed class BlowfishCfb64Cipher : ICipher
             else
             {
                 // Zero-S-box mode (F=0): each round reduces to XOR with P values.
-                for (var i = 1; i <= 13; i += 2)
+                for (var i = 1; i <= numRounds - 1; i += 2)
                 {
                     xr ^= _rawP[i];
                     xl ^= _rawP[i + 1];
                 }
             }
 
-            xr ^= _rawP[15]; // P[15] — final whitening (ROUNDS+1)
+            xr ^= _rawP[numRounds + 1]; // final whitening
 
             // BF output swap: left output ← xr, right output ← xl
             WriteBE(_iv, 0, xr);
