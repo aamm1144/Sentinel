@@ -34,12 +34,32 @@ public sealed class ProxyHost : IAsyncDisposable
                 "keystream-capture script to populate it.",
                 cfg.HandshakeChainTablePath);
 
-        Func<bool, ICipher>? factory = chainTable.Count > 0
-            ? encrypting => new ChainTableCfb64Cipher(chainTable, encrypting)
-            : null;
+        Func<bool, ICipher> CreateFactory(ProxyEndpointConfig ep)
+        {
+            var type = ep.HandshakeCipher?.ToLowerInvariant() ?? "auto";
+
+            return encrypting =>
+            {
+                if (type == "cast5")
+                    return new Cast5Cfb64Cipher(encrypting);
+
+                if (type == "chaintable" && chainTable.Count > 0)
+                    return new ChainTableCfb64Cipher(chainTable, encrypting);
+
+                // Default / Standard Blowfish (uses extracted tables if available)
+                var bf = new BlowfishCfb64Cipher(encrypting);
+                try {
+                    // Try to use extracted 18-entry P-array if it matches standard size
+                    bf.SetRawState(BlowfishTables.P, BlowfishTables.S1, BlowfishTables.S2, BlowfishTables.S3, BlowfishTables.S4);
+                } catch {
+                    // Fallback to default BouncyCastle Pi tables if custom ones fail
+                }
+                return bf;
+            };
+        }
 
         _servers = cfg.Endpoints
-            .Select(ep => new ProxyServer(ep, packetLogger, sessionLogger, serverLogger, factory))
+            .Select(ep => new ProxyServer(ep, packetLogger, sessionLogger, serverLogger, CreateFactory(ep)))
             .ToList();
         _consoleVerbosity = (cfg.ConsoleVerbosity ?? "minimal").ToLowerInvariant();
         _logger = logger;
