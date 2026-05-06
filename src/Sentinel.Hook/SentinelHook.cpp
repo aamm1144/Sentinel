@@ -27,8 +27,8 @@ struct RedirectEntry {
 };
 
 static RedirectEntry g_redirects[] = {
-    { 0, "170.33.9.35"  },
-    { 0, "121.207.250.57" },
+    { 0, "51.75.116.175"  },
+    { 0, "51.75.241.136" },
 };
 
 static const int g_redirectCount = sizeof(g_redirects) / sizeof(g_redirects[0]);
