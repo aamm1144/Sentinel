@@ -25,6 +25,7 @@ public sealed class PacketLogger : IPacketLogger
     private readonly string _logDirectory;
 
     private readonly ConcurrentDictionary<Guid, FileStream> _sessionFiles = new();
+    private readonly ConcurrentDictionary<Guid, StreamWriter> _sessionTextFiles = new();
 
     // Reusable header buffer: 8 (timestamp) + 1 (direction) + 4 (length) = 13 bytes
     private const int HeaderSize = 13;
@@ -51,6 +52,10 @@ public sealed class PacketLogger : IPacketLogger
         var stream = GetOrCreateSessionFile(sessionId);
         await WriteBinaryEntryAsync(stream, direction, data, timestamp);
 
+        // Write to text hex log (always)
+        var textWriter = GetOrCreateSessionTextFile(sessionId);
+        await WriteTextEntryAsync(textWriter, direction, data, timestamp);
+
         // Write to console based on verbosity
         if (_consoleVerbosity == "verbose")
             WriteConsoleVerbose(sessionId, direction, data, timestamp);
@@ -65,6 +70,10 @@ public sealed class PacketLogger : IPacketLogger
         {
             try { await stream.FlushAsync(); } catch { }
         }
+        foreach (var writer in _sessionTextFiles.Values)
+        {
+            try { await writer.FlushAsync(); } catch { }
+        }
     }
 
     private FileStream GetOrCreateSessionFile(Guid sessionId)
@@ -73,9 +82,22 @@ public sealed class PacketLogger : IPacketLogger
         {
             var fileName = $"session_{id:N}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.bin";
             var filePath = Path.Combine(_logDirectory, fileName);
-            _logger.LogDebug("Created packet log: {Path}", filePath);
+            _logger.LogDebug("Created binary packet log: {Path}", filePath);
             return new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.Read,
                 bufferSize: 65536, useAsync: true);
+        });
+    }
+
+    private StreamWriter GetOrCreateSessionTextFile(Guid sessionId)
+    {
+        return _sessionTextFiles.GetOrAdd(sessionId, id =>
+        {
+            var fileName = $"session_{id:N}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.log";
+            var filePath = Path.Combine(_logDirectory, fileName);
+            _logger.LogDebug("Created text hex log: {Path}", filePath);
+            var stream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.Read,
+                bufferSize: 65536, useAsync: true);
+            return new StreamWriter(stream, Encoding.UTF8, leaveOpen: false);
         });
     }
 
@@ -102,6 +124,28 @@ public sealed class PacketLogger : IPacketLogger
 
         // Write data
         await stream.WriteAsync(data);
+    }
+
+    private static async ValueTask WriteTextEntryAsync(
+        StreamWriter writer,
+        PacketDirection direction,
+        ReadOnlyMemory<byte> data,
+        DateTimeOffset timestamp)
+    {
+        var arrow = direction == PacketDirection.ClientToServer ? "C→S" : "S→C";
+        var time = timestamp.ToLocalTime().ToString("HH:mm:ss.fff");
+
+        await writer.WriteAsync($"[{time}] {arrow}  {data.Length,6} bytes   ");
+
+        var span = data.Span;
+        for (var i = 0; i < data.Length; i++)
+        {
+            await writer.WriteAsync(span[i].ToString("X2"));
+            if (i < data.Length - 1)
+                await writer.WriteAsync(' ');
+        }
+
+        await writer.WriteLineAsync();
     }
 
     /// <summary>"normal" verbosity — one line per packet, no hex.</summary>
@@ -162,5 +206,16 @@ public sealed class PacketLogger : IPacketLogger
             catch { }
         }
         _sessionFiles.Clear();
+
+        foreach (var kvp in _sessionTextFiles)
+        {
+            try
+            {
+                await kvp.Value.FlushAsync();
+                await kvp.Value.DisposeAsync();
+            }
+            catch { }
+        }
+        _sessionTextFiles.Clear();
     }
 }
