@@ -16,7 +16,7 @@ jobs:
       - name: Build Sentinel CLI
         run: dotnet publish src/Sentinel.CLI -c Release -r win-x64 --self-contained true -o ./publish/cli
       - name: Build Sentinel Loader
-        run: dotnet publish src/Sentinel.Loader -c Release -r win-x64 --self-contained true -o ./publish/loader
+        run: dotnet publish src/Sentinel.Loader -c Release -r win-x86 --self-contained true -o ./publish/loader
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
