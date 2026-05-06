@@ -27,6 +27,11 @@ public sealed class ProxyEndpointConfig
     /// <see cref="EnableMitm"/>; if both are set, MITM takes precedence.
     /// </summary>
     public bool EnableGameplayDecrypt { get; set; }
+
+    /// <summary>
+    /// Handshake cipher type: "Blowfish", "Cast5", "ChainTable", or "Auto".
+    /// </summary>
+    public string HandshakeCipher { get; set; } = "Auto";
 }
 
 /// <summary>
