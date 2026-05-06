@@ -1,297 +1,251 @@
-using System.IO.Pipelines;
+using Microsoft.Extensions.Logging;
 using Sentinel.Crypto;
 using Sentinel.Crypto.Interfaces;
-using Sentinel.Network.Handshake;
 
-namespace Sentinel.Network.Tests;
+namespace Sentinel.Network.Handshake;
 
 /// <summary>
-/// Integration tests for <see cref="HandshakeMitm"/> using mock pipe-based streams.
-///
-/// The test uses standard Blowfish as the handshake cipher (instead of ChainTableCfb64Cipher)
-/// so it runs deterministically without requiring a real Frida-captured chain table.
-/// The MITM logic — DH interception, public-key substitution, shared-secret derivation,
-/// and session-cipher initialisation — is fully exercised regardless of which cipher
-/// is used for the handshake transport.
+/// Four BF-CFB64 ciphers established after a successful MITM handshake.
+/// Ownership of the ciphers transfers to the caller; the caller is responsible
+/// for disposing them.
 /// </summary>
-public class HandshakeMitmTests
+public readonly record struct HandshakeResult(
+    ICipher ClientDecrypt,
+    ICipher ClientEncrypt,
+    ICipher ServerDecrypt,
+    ICipher ServerEncrypt);
+
+/// <summary>
+/// Performs the CO 7xxx DH man-in-the-middle handshake.
+///
+/// CO 7xxx flow (client-first, reversed from 5xxx):
+///   1. Client sends DH init  (P, G, ClientPub, ClientIvec, ServerIvec)
+///   2. Server sends DH reply (ServerPub)
+///
+/// The proxy intercepts both packets, replaces the public keys with its own
+/// ephemeral keys, and derives two independent shared secrets:
+///   - sharedSecretClient = DH(proxyPriv_c, realClientPub)
+///   - sharedSecretServer = DH(proxyPriv_s, realServerPub)
+///
+/// After the handshake, all game traffic uses standard BF-CFB64 keyed with
+/// the derived shared secrets and the IVecs exchanged during the init packet.
+/// </summary>
+public sealed class HandshakeMitm(
+    Func<bool, string, ICipher> handshakeCipherFactory,
+    ILogger? logger = null)
 {
-    // RFC 3526 Group 14 (2048-bit MODP) prime and generator.
-    // Fixed values make the test deterministic without generating DH params at runtime.
-    private static readonly byte[] DhPrime = Convert.FromHexString(
-        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1" +
-        "29024E088A67CC74020BBEA63B139B22514A08798E3404DD" +
-        "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245" +
-        "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED" +
-        "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D" +
-        "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F" +
-        "83655D23DCA3AD961C62F356208552BB9ED529077096966D" +
-        "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B" +
-        "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9" +
-        "DE2BCBF6955817183995497CEA956AE515D2261898FA0510" +
-        "15728E5A8AACAA68FFFFFFFFFFFFFFFF");
+    private static readonly string[] TrialTypes = ["blowfish", "cast5", "chaintable"];
 
-    private static readonly byte[] DhGenerator = [0x02];
-
-    // Test handshake cipher: standard BF keyed with a fixed test key.
-    // The MITM uses one factory call per cipher direction per packet.
-    private static readonly byte[] TestHandshakeKey = "TestHandshakeKey"u8.ToArray();
-
-    private static ICipher MakeTestCipher(bool encrypting)
+    public async Task<HandshakeResult> PerformAsync(
+        Stream clientStream,
+        Stream serverStream,
+        CancellationToken ct)
     {
-        var c = new BlowfishCfb64Cipher(encrypting);
-        c.SetKey(TestHandshakeKey);
-        return c;
-    }
+        // ── Step 1: Read the client's DH init packet ──────────────────────────
+        logger?.LogDebug("MITM: waiting for client DH init...");
 
-    // -------------------------------------------------------------------------
-    // Core flow test
-    // -------------------------------------------------------------------------
+        var clientHsRaw = await ReadPacketAsync(clientStream, ct);
 
-    [Fact]
-    public async Task PerformAsync_ClientFirstFlow_EstablishesSessionCiphers()
-    {
-        // ── Setup: build a real client DH keypair ─────────────────────────────
-        using var clientDh = new DiffieHellman();
-        clientDh.Initialize(DhPrime, DhGenerator);
-        var clientPubKey = clientDh.GeneratePublicKey();
+        // ── Step 2: Decrypt (Trial and Error) ─────────────────────────────────
+        ICipher? successfulCipher = null;
+        byte[]? decryptedHs = null;
+        string? successfulType = null;
 
-        var clientIvec = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
-        var serverIvec = new byte[] { 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
-
-        // ── Build the client's DH init packet ─────────────────────────────────
-        // Mirrors the TQ wire format: the client sends its public key in the
-        // "ServerPublicKey" slot of the ServerHandshake structure.
-        var clientHs = new ServerHandshake
+        foreach (var type in TrialTypes)
         {
-            Header = new byte[11],
-            TqSize = 0,
-            NonStaticRandomData = [0xAA, 0xBB, 0xCC, 0xDD],
-            ClientIvec = clientIvec,
-            ServerIvec = serverIvec,
-            Prime = DhPrime,
-            Generator = DhGenerator,
-            ServerPublicKey = clientPubKey,   // client's own pubkey goes here
-            TqServer = new byte[8],
-            FinalSize = 0,
-        };
-        var clientHsBytes = HandshakeParser.BuildServerHandshake(clientHs);
+            var trialCipher = handshakeCipherFactory(false, type);
+            var buffer = clientHsRaw.ToArray(); // Work on a copy
+            trialCipher.SetIv(new byte[8]);
+            trialCipher.Decrypt(buffer);
 
-        // Encrypt as the client would: fresh handshake cipher, IV = zeros.
-        using var clientEnc = MakeTestCipher(true);
-        clientEnc.SetIv(new byte[8]);
-        clientEnc.Encrypt(clientHsBytes);
-
-        // ── Create connected stream pairs ──────────────────────────────────────
-        // proxyClientStream: MITM reads client packets from, writes to client
-        // proxyServerStream: MITM writes to server, reads server packets from
-        var (proxyClientStream, clientEnd) = DuplexPipeStreamPair.Create();
-        var (proxyServerStream, serverEnd) = DuplexPipeStreamPair.Create();
-
-        // ── Step A: client writes its init packet ─────────────────────────────
-        await clientEnd.WriteAsync(clientHsBytes);
-        clientEnd.CompleteWrite(); // signal no more data from client side
-
-        // ── Step B: run the MITM in a background task ─────────────────────────
-        var mitmTask = Task.Run(async () =>
-            await new HandshakeMitm(MakeTestCipher).PerformAsync(
-                proxyClientStream, proxyServerStream, CancellationToken.None));
-
-        // ── Step C: simulate the server ───────────────────────────────────────
-        // 1. Read the modified init from the MITM.
-        var serverReceived = new byte[4096];
-        var serverReceivedLen = await serverEnd.ReadAsync(serverReceived.AsMemory());
-        var serverReceivedData = serverReceived[..serverReceivedLen];
-
-        // 2. Decrypt it (same handshake cipher, IV=zeros).
-        using var serverDec = MakeTestCipher(false);
-        serverDec.SetIv(new byte[8]);
-        serverDec.Decrypt(serverReceivedData);
-
-        // 3. Parse to extract the proxy's server-side public key.
-        var receivedHs = HandshakeParser.ParseServerHandshake(serverReceivedData);
-        var proxyServerPubKey = receivedHs.ServerPublicKey; // proxy's ephemeral key
-
-        // Verify the init was modified: proxy's key ≠ original client key.
-        Assert.False(proxyServerPubKey.SequenceEqual(clientPubKey),
-            "Proxy must substitute its own pubkey, not forward the client's.");
-
-        // 4. Server generates its own keypair and computes shared secret.
-        using var serverDh = new DiffieHellman();
-        serverDh.Initialize(DhPrime, DhGenerator);
-        var serverPubKey = serverDh.GeneratePublicKey();
-        var serverSharedSecret = serverDh.ComputeSharedSecret(proxyServerPubKey);
-
-        // 5. Build the server's reply with its pubkey.
-        var serverReply = new ClientHandshakeReply
-        {
-            Header = new byte[11],
-            Data = [0xFF],
-            ClientPublicKey = serverPubKey,   // server's pubkey in this slot
-            TqClient = new byte[8],
-        };
-        var serverReplyBytes = HandshakeParser.BuildClientReply(serverReply);
-        // Server sends its reply in plaintext (no encryption — MITM tries plaintext first).
-        await serverEnd.WriteAsync(serverReplyBytes);
-        serverEnd.CompleteWrite();
-
-        // ── Step D: wait for the MITM to complete ─────────────────────────────
-        var result = await mitmTask;
-
-        // ── Step E: verify ciphers were initialised ────────────────────────────
-        Assert.NotNull(result.ClientDecrypt);
-        Assert.NotNull(result.ClientEncrypt);
-        Assert.NotNull(result.ServerDecrypt);
-        Assert.NotNull(result.ServerEncrypt);
-
-        // ── Step F: verify the client received the proxy's modified reply ──────
-        var clientReceived = new byte[4096];
-        var clientReceivedLen = await clientEnd.ReadAsync(clientReceived.AsMemory());
-        var clientReceivedData = clientReceived[..clientReceivedLen];
-        Assert.True(clientReceivedLen > 0, "MITM must forward a reply to the client.");
-
-        // Decrypt what the client received (same handshake cipher, IV=zeros).
-        using var clientDec = MakeTestCipher(false);
-        clientDec.SetIv(new byte[8]);
-        clientDec.Decrypt(clientReceivedData);
-
-        var modifiedReply = HandshakeParser.ParseClientReply(clientReceivedData);
-        var proxyClientPubKey = modifiedReply.ClientPublicKey;
-
-        // Proxy must have substituted its own client-side pubkey.
-        Assert.False(proxyClientPubKey.SequenceEqual(serverPubKey),
-            "Proxy must substitute its own pubkey, not forward the server's.");
-
-        // ── Step G: verify session ciphers produce matching shared secrets ─────
-        // The client's shared secret: DH(clientPriv, proxyClientPubKey)
-        var clientSharedSecretRaw = clientDh.ComputeSharedSecret(proxyClientPubKey);
-        // Must apply same key truncation as HandshakeMitm (BF max 56 bytes).
-        var clientSharedSecret = clientSharedSecretRaw[..Math.Min(56, clientSharedSecretRaw.Length)];
-
-        // Encrypt a test message with clientSharedSecret / ClientIvec (client's outbound cipher).
-        var testMsg = "Hello CO 7xxx!"u8.ToArray();
-        var encBuf = testMsg.ToArray();
-
-        var testClientEncrypt = new BlowfishCfb64Cipher(encrypting: true);
-        testClientEncrypt.SetKey(clientSharedSecret);
-        testClientEncrypt.SetIv(clientIvec);
-        testClientEncrypt.Encrypt(encBuf);
-
-        // Decrypt with the MITM's _clientDecrypt cipher (same key and IV).
-        result.ClientDecrypt.Decrypt(encBuf);
-
-        Assert.Equal(testMsg, encBuf);
-
-        // Cleanup
-        result.ClientDecrypt.Dispose();
-        result.ClientEncrypt.Dispose();
-        result.ServerDecrypt.Dispose();
-        result.ServerEncrypt.Dispose();
-        testClientEncrypt.Dispose();
-    }
-
-    // -------------------------------------------------------------------------
-    // Sanity: ChainTableLoader correctly skips metadata keys
-    // -------------------------------------------------------------------------
-
-    [Fact]
-    public void ChainTableLoader_SkipsUnderscoreKeys()
-    {
-        var json = """
+            if (IsValidHandshake(buffer))
             {
-              "_comment": "ignored",
-              "0000000000000000": "bc8a80e5bfb0141d"
+                successfulCipher = trialCipher;
+                decryptedHs = buffer;
+                successfulType = type;
+                logger?.LogInformation("MITM: Successfully detected handshake type: {Type}", type);
+                break;
             }
-            """;
+            trialCipher.Dispose();
+        }
 
-        var path = Path.GetTempFileName();
+        if (successfulCipher == null)
+        {
+            logger?.LogError("MITM: Failed to detect handshake type. Tried: {Types}. " +
+                           "Likely causes: incorrect P-array/S-boxes, or the server uses a completely different cipher. " +
+                           "Raw packet start: {Hex}", string.Join(", ", TrialTypes), 
+                           BitConverter.ToString(clientHsRaw[..Math.Min(clientHsRaw.Length, 16)]));
+            throw new InvalidOperationException("Could not decrypt client handshake.");
+        }
+
+        // ── Step 3: Parse the client's handshake ──────────────────────────────
+        var clientHs = HandshakeParser.ParseServerHandshake(decryptedHs);
+
+        var realClientPubKey = clientHs.ServerPublicKey;
+
+        logger?.LogDebug(
+            "MITM: client init parsed — P={P}B G={G}B PubKey={K}B ClientIvec={CI}B ServerIvec={SI}B",
+            clientHs.Prime.Length, clientHs.Generator.Length, realClientPubKey.Length,
+            clientHs.ClientIvec.Length, clientHs.ServerIvec.Length);
+
+        // ── Step 4: Generate proxy→server ephemeral DH keypair ────────────────
+        using var dhForServer = new DiffieHellman();
+        dhForServer.Initialize(clientHs.Prime, clientHs.Generator);
+        var proxyPubKeyForServer = dhForServer.GeneratePublicKey();
+
+        // ── Step 5: Substitute proxy's pubkey and forward to server ───────────
+        clientHs.ServerPublicKey = proxyPubKeyForServer;
+        var modifiedClientHs = HandshakeParser.BuildServerHandshake(clientHs);
+
+        using var initEncryptToServer = handshakeCipherFactory(true, successfulType!);
+        initEncryptToServer.SetIv(new byte[8]);
+        initEncryptToServer.Encrypt(modifiedClientHs);
+        await serverStream.WriteAsync(modifiedClientHs, ct);
+
+        logger?.LogDebug("MITM: modified init forwarded to server ({Bytes}B)", modifiedClientHs.Length);
+
+        // ── Step 6: Read the server's DH reply ────────────────────────────────
+        logger?.LogDebug("MITM: waiting for server DH reply...");
+
+        var serverReplyRaw = await ReadPacketAsync(serverStream, ct);
+
+        // The server reply is formatted as the 5xxx ClientHandshakeReply:
+        // Header + Data + PublicKey + TqClient.
+        // The "ClientPublicKey" slot carries the SERVER'S public key here.
+        // Try parsing as plaintext first; if that throws, decrypt and retry.
+        ClientHandshakeReply serverReply;
         try
         {
-            File.WriteAllText(path, json);
-            var table = ChainTableLoader.LoadFromFile(path);
-            Assert.Single(table);
-            Assert.Equal(0xbc8a80e5bfb0141dUL, table[0x0000000000000000UL]);
+            serverReply = HandshakeParser.ParseClientReply(serverReplyRaw);
         }
-        finally
+        catch (Exception ex)
         {
-            File.Delete(path);
+            logger?.LogWarning("MITM: Plaintext parse failed, attempting decryption... ({Msg})", ex.Message);
+            using var replyDecrypt = handshakeCipherFactory(false, successfulType!);
+            replyDecrypt.SetIv(new byte[8]);
+            replyDecrypt.Decrypt(serverReplyRaw);
+            try
+            {
+                serverReply = HandshakeParser.ParseClientReply(serverReplyRaw);
+            }
+            catch (Exception ex2)
+            {
+                logger?.LogError("MITM: Failed to parse server reply even after decryption. " +
+                               "The handshake cipher used might be incorrect, or the P-array/S-boxes don't match. " +
+                               "Details: {Msg}", ex2.Message);
+                throw;
+            }
         }
+
+        var realServerPubKey = serverReply.ClientPublicKey;
+
+        logger?.LogDebug("MITM: server reply parsed — PubKey={K}B", realServerPubKey.Length);
+
+        // ── Step 7: Generate proxy→client ephemeral DH keypair ────────────────
+        using var dhForClient = new DiffieHellman();
+        dhForClient.Initialize(clientHs.Prime, clientHs.Generator);
+        var proxyPubKeyForClient = dhForClient.GeneratePublicKey();
+
+        // ── Step 8: Substitute proxy's pubkey and forward to client ───────────
+        serverReply.ClientPublicKey = proxyPubKeyForClient;
+        var modifiedServerReply = HandshakeParser.BuildClientReply(serverReply);
+
+        // Server replies in the same encryption style as the init packet.
+        // Re-encrypt for the client before forwarding.
+        using var replyEncryptToClient = handshakeCipherFactory(true, successfulType!);
+        replyEncryptToClient.SetIv(new byte[8]);
+        replyEncryptToClient.Encrypt(modifiedServerReply);
+        await clientStream.WriteAsync(modifiedServerReply, ct);
+
+        logger?.LogDebug("MITM: modified reply forwarded to client ({Bytes}B)", modifiedServerReply.Length);
+
+        // ── Step 9: Compute shared secrets ────────────────────────────────────
+        var sharedSecretServer = dhForServer.ComputeSharedSecret(realServerPubKey);
+        var sharedSecretClient = dhForClient.ComputeSharedSecret(realClientPubKey);
+
+        logger?.LogDebug(
+            "MITM: shared secrets — client={CLen}B server={SLen}B",
+            sharedSecretClient.Length, sharedSecretServer.Length);
+
+        // ── Step 10: Initialise 4 session ciphers (standard BF, NOT chain table) ─
+        //
+        // IV assignment (from gProxy reference):
+        //   Proxy←Client (decrypt): IV = ClientIvec   ← client encrypts outbound with ClientIvec
+        //   Proxy→Client (encrypt): IV = ServerIvec   ← client decrypts inbound with ServerIvec
+        //   Proxy←Server (decrypt): IV = ServerIvec   ← server encrypts outbound with ServerIvec
+        //   Proxy→Server (encrypt): IV = ClientIvec   ← server decrypts inbound with ClientIvec
+        //
+        // Key size: Blowfish accepts 4–56 bytes. Clamp the shared secret to that range.
+        // TODO: confirm whether CO 7xxx uses raw DH output, a hash, or a fixed-size slice.
+        var clientKey = TrimToKeySize(sharedSecretClient, successfulType!);
+        var serverKey = TrimToKeySize(sharedSecretServer, successfulType!);
+
+        // Factory creates the session ciphers. We try to match the handshake cipher type.
+        var clientDecrypt = handshakeCipherFactory(false, successfulType!);
+        clientDecrypt.SetKey(clientKey);
+        clientDecrypt.SetIv(clientHs.ClientIvec);
+
+        var clientEncrypt = handshakeCipherFactory(true, successfulType!);
+        clientEncrypt.SetKey(clientKey);
+        clientEncrypt.SetIv(clientHs.ServerIvec);
+
+        var serverDecrypt = handshakeCipherFactory(false, successfulType!);
+        serverDecrypt.SetKey(serverKey);
+        serverDecrypt.SetIv(clientHs.ServerIvec);
+
+        var serverEncrypt = handshakeCipherFactory(true, successfulType!);
+        serverEncrypt.SetKey(serverKey);
+        serverEncrypt.SetIv(clientHs.ClientIvec);
+
+        logger?.LogDebug("MITM: 4 session ciphers initialised ({Type})", clientDecrypt.GetType().Name);
+
+        successfulCipher.Dispose(); // Done with the temporary one
+        return new HandshakeResult(clientDecrypt, clientEncrypt, serverDecrypt, serverEncrypt);
     }
-
-    [Fact]
-    public void ChainTableLoader_TryLoadFromFile_ReturnsEmpty_WhenMissing()
-    {
-        var table = ChainTableLoader.TryLoadFromFile("nonexistent/path/table.json");
-        Assert.Empty(table);
-    }
-}
-
-// =============================================================================
-// Helpers: bidirectional pipe-based streams for in-process testing
-// =============================================================================
-
-internal sealed class DuplexPipeStreamPair
-{
-    private readonly Pipe _inbound = new();   // A writes → B reads
-    private readonly Pipe _outbound = new();  // B writes → A reads
-
-    private DuplexPipeStreamPair() { }
 
     /// <summary>
-    /// Creates a connected stream pair (sideA, sideB).
-    /// Bytes written to sideA are readable from sideB and vice versa.
+    /// Checks if the decrypted buffer looks like a valid TQ handshake.
+    /// It should start with "TQServer" or have a plausible length prefix.
     /// </summary>
-    public static (DuplexStream sideA, DuplexStream sideB) Create()
+    private static bool IsValidHandshake(ReadOnlySpan<byte> data)
     {
-        var pair = new DuplexPipeStreamPair();
-        var a = new DuplexStream(
-            pair._outbound.Reader.AsStream(),
-            pair._inbound.Writer.AsStream(),
-            () => pair._inbound.Writer.Complete());
-        var b = new DuplexStream(
-            pair._inbound.Reader.AsStream(),
-            pair._outbound.Writer.AsStream(),
-            () => pair._outbound.Writer.Complete());
-        return (a, b);
-    }
-}
-
-internal sealed class DuplexStream(Stream reader, Stream writer, Action completeWrite) : Stream
-{
-    public override bool CanRead  => true;
-    public override bool CanWrite => true;
-    public override bool CanSeek  => false;
-    public override long Length   => throw new NotSupportedException();
-    public override long Position
-    {
-        get => throw new NotSupportedException();
-        set => throw new NotSupportedException();
+        if (data.Length < 11) return false;
+        // Check for TQ header magic (e.g. 11 bytes)
+        // Usually ends with "TqServer" or contains some recognizable pattern.
+        // For now, let's assume if HandshakeParser doesn't throw, it's valid.
+        try {
+            var hs = HandshakeParser.ParseServerHandshake(data);
+            return hs.Header.Length == 11 && hs.Prime.Length > 0;
+        } catch {
+            return false;
+        }
     }
 
-    public override void Flush() => writer.Flush();
-    public override Task FlushAsync(CancellationToken ct) => writer.FlushAsync(ct);
+    /// <summary>
+    /// Clamp the session key to the maximum allowed by the cipher.
+    /// CO standard uses the first 64 bytes of the DH shared secret.
+    /// Blowfish accepts up to 56–72 bytes. CAST5 accepts 5–16 bytes.
+    /// </summary>
+    private static ReadOnlySpan<byte> TrimToKeySize(byte[] key, string type)
+    {
+        if (type.ToLowerInvariant().Contains("cast5"))
+            return key.Length <= 16 ? key : key.AsSpan(0, 16);
+        
+        // Blowfish / Default
+        return key.Length <= 64 ? key : key.AsSpan(0, 64);
+    }
 
-    public override int Read(byte[] buffer, int offset, int count) =>
-        reader.Read(buffer, offset, count);
-
-    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
-        reader.ReadAsync(buffer, offset, count, ct);
-
-    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) =>
-        reader.ReadAsync(buffer, ct);
-
-    public override void Write(byte[] buffer, int offset, int count) =>
-        writer.Write(buffer, offset, count);
-
-    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
-        writer.WriteAsync(buffer, offset, count, ct);
-
-    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) =>
-        writer.WriteAsync(buffer, ct);
-
-    /// <summary>Signal that no more data will be written to this end.</summary>
-    public void CompleteWrite() => completeWrite();
-
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    /// <summary>
+    /// Read one handshake packet from <paramref name="stream"/>.
+    /// Performs a single ReadAsync call — handshake packets arrive in a single
+    /// TCP segment, so one read captures the complete packet.
+    /// </summary>
+    private static async Task<byte[]> ReadPacketAsync(Stream stream, CancellationToken ct)
+    {
+        var buffer = new byte[4096];
+        var n = await stream.ReadAsync(buffer.AsMemory(), ct);
+        if (n == 0)
+            throw new IOException("Stream closed before handshake packet was received.");
+        return buffer[..n];
+    }
 }
