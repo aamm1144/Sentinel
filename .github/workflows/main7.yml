@@ -1,10 +1,4 @@
-      - name: Collect DLLs
+      - name: Copy DLL
         run: |
-          if (Test-Path "src/Sentinel.Hook/build/SentinelHook.dll") {
-            copy src/Sentinel.Hook/build/SentinelHook.dll publish/cli/
-            copy src/Sentinel.Hook/build/SentinelHook.dll publish/loader/
-          } elseif (Test-Path "src/Sentinel.Hook/build/Release/SentinelHook.dll") {
-            copy src/Sentinel.Hook/build/Release/SentinelHook.dll publish/cli/
-            copy src/Sentinel.Hook/build/Release/SentinelHook.dll publish/loader/
-          }
-        shell: pwsh
+          xcopy src\Sentinel.Hook\build\SentinelHook.dll publish\cli\ /Y /I
+          xcopy src\Sentinel.Hook\build\SentinelHook.dll publish\loader\ /Y /I
